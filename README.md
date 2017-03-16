@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://cdn.rawgit.com/reginaldl/docoment/master/logo.svg" alt="Docoment Logo" width="40%"/>
+  <img src="https://cdn.rawgit.com/reginaldl/docoment/master/logo.svg" alt="Docoment Logo" width="50%"/>
 </p>
 
 # Overview
@@ -23,6 +23,8 @@ path = <path>/src
        <path>/include
 extra_args = -I <path>/include
 files = *.c
+	*.h
+exclude = */test/*
 
 [output]
 json = true
