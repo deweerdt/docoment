@@ -26,8 +26,9 @@ def comment_to_dict(location, comment):
             print("Warning: In %s, param %s already documented." % (location, name))
         result['params'][name] = value
 
-    for line in comment.split('\n'):
-        line = line.lstrip('/*< ').rstrip('*/ ')
+    for full_line in comment.split('\n'):
+
+        line = full_line.lstrip('/*< ').rstrip('*/ ')
         if line:
             if line.startswith('@param'):
                 line = line[6:].lstrip()
@@ -35,11 +36,18 @@ def comment_to_dict(location, comment):
                     name, desc = line.split(None, 1)
                     _add_param(name, desc.strip())
                 except ValueError:
-                    print("Warning: Could not extract param from: %s" % line)
+                    # This should have been caught by -Wdocumentation, let's silently pass
+                    pass
             elif line.startswith('@'):
-                key, value = line[1:].split(None, 1)
+                try:
+                    key, value = line[1:].split(None, 1)
+                except ValueError:
+                    print("Warning: %s" % full_line)
+                    print("Warning: ^~~ Could not extract value from: %s" % line)
+                    continue
                 if key in result:
-                    print("Warning: In %s, %s already documented." % (location, key))
+                    print("Warning: %s" % full_line)
+                    print("Warning: ^~~ In %s, %s already documented." % (location, key))
                 result[key] = value.lstrip()
             else:
                 brief.append(line)
@@ -47,10 +55,41 @@ def comment_to_dict(location, comment):
         result['brief'] = '\n'.join(brief)
     return result
 
+def get_line_in_file(path, number):
+    with open(path) as f:
+        i = 0
+        for line in f.readlines():
+            i += 1
+            if i == number:
+                return line.strip()
+
+class FileMatch(object):
+
+    def __init__(self, includes, excludes=None):
+        self.inc_filters = [re.compile(fnmatch.translate(x)) for x in includes]
+        self.exc_filters = [re.compile(fnmatch.translate(x)) for x in excludes] if excludes else []
+
+    def exclude(self, s):
+        for curfilter in self.exc_filters:
+            if curfilter.match(s):
+                return True
+        return False
+
+    def match(self, s):
+        for curfilter in self.inc_filters:
+            if curfilter.match(s) and not self.exclude(s):
+                return True
+        return False
+
+    def filter(self, strings):
+        for s in strings:
+            if self.match(s) and not self.exclude(s):
+                yield s
 
 class Docoment(object):
 
     def __init__(self, config_file="docofile"):
+        self.files = {}
         self.definitions = {}
         self.decl_types = {
             clang.cindex.CursorKind.TYPE_ALIAS_DECL: None,
@@ -67,11 +106,14 @@ class Docoment(object):
         config.read(config_file)
         self.project = config.get('project', 'name')
         self.paths = shlex.split(config.get('project', 'path'))
-        self.patterns = shlex.split(config.get('project', 'files'))
+        inc_files = shlex.split(config.get('project', 'files'))
+        exc_files = shlex.split(config.get('project', 'exclude')) if config.has_option('project', 'exclude') else None
+        self.filematch = FileMatch(inc_files, exc_files)
         self.output_json = config.getboolean('output', 'json') if config.has_option('output', 'json') else True
         self.output_html = config.getboolean('output', 'html') if config.has_option('output', 'html') else True
         self.templates = config.get('html', 'templates') if config.has_option('html', 'templates') else './templates'
-        self.extra_args = self._get_default_includes()
+        self.extra_args = ['-Wdocumentation']
+        self.extra_args.extend(self._get_default_includes())
         if config.has_option('project', 'extra_args'):
             self.extra_args.extend(shlex.split(config.get('project', 'extra_args')))
         if os.environ.get('CFLAGS'):
@@ -96,24 +138,46 @@ class Docoment(object):
         if not location.file:
             return False
         for path in self.paths:
-            if path in location.file.name:
+            if path in location.file.name and self.filematch.match(location.file.name):
                 return True
         return False
+
+    def record_file(self, node):
+        if node.kind == clang.cindex.CursorKind.TRANSLATION_UNIT:
+            if node.spelling not in self.files:
+                self.files[node.spelling] = {'definitions': {}}
+            token = node.get_tokens().next()
+            if token.spelling.startswith('/*'):
+                self.files[node.spelling]['comment'] = comment_to_dict(node.location, token.spelling)
+        elif node.location.file.name not in self.files:
+            self.files[node.location.file.name] = {'definitions': {}}
+            tu = self.index.parse(node.location.file.name)
+            tokens = [x for x in tu.get_tokens(extent=tu.get_extent(node.location.file.name, (0, 0)))]
+            if tokens and tokens[0].kind == clang.cindex.TokenKind.COMMENT:
+                self.files[node.location.file.name]['comment'] = comment_to_dict(node.location, tokens[0].spelling)
+
+    def add_definition_to_file(self, node):
+        if node.location.file.name not in self.files:
+            self.record_file(node)
+        if node.kind.name not in self.files[node.location.file.name]['definitions']:
+            self.files[node.location.file.name]['definitions'][node.kind.name] = [node.get_usr()]
+        else:
+            self.files[node.location.file.name]['definitions'][node.kind.name].append(node.get_usr())
 
     def record_definition(self, node):
         usr = node.get_usr()
         if usr and node.kind in self.decl_types:
             if usr not in self.definitions:
+                self.add_definition_to_file(node)
                 self.definitions[usr] = {
                     'kind': node.kind.name,
                     'spelling': node.spelling,
                     'location': {
+                        'file': node.location.file.name,
                         'line': node.location.line,
                         'column': node.location.column
                     }
                 }
-                if node.location.file:
-                    self.definitions[usr]['location']['file'] = node.location.file.name
                 if node.raw_comment:
                     self.definitions[usr]['comment'] = comment_to_dict(node.location, node.raw_comment)
                 func = self.decl_types[node.kind]
@@ -175,13 +239,18 @@ class Docoment(object):
         self.decl_types[clang.cindex.CursorKind.TYPEDEF_DECL] = _typedef_to_dict
 
     def _parse_file(self, path):
+        if self.filematch.exclude(path) or path.endswith('.h'):
+            return
         print("Parsing %s" % path)
         tu = self.index.parse(path, args=self.extra_args,
-                              options=clang.cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+                              options=(clang.cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD & clang.cindex.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES))
         for diagnostic in tu.diagnostics:
             if diagnostic.severity > clang.cindex.Diagnostic.Warning:
                 print(diagnostic)
                 sys.exit(-1)
+            elif diagnostic.option == '-Wdocumentation':
+                print('Warning: %s' % get_line_in_file(path, diagnostic.location.line))
+                print('Warning:%s^~~ %s' % ((' ' * diagnostic.location.column), diagnostic.spelling))
         nodes = [tu.cursor]
         while len(nodes):
             node = nodes.pop()
@@ -191,11 +260,12 @@ class Docoment(object):
                 else:
                     nodes.extend([c for c in node.get_children()])
             elif node.kind == clang.cindex.CursorKind.TRANSLATION_UNIT:
+                self.record_file(node)
                 nodes.extend([c for c in node.get_children()])
 
     def generate_json(self, path):
         with open(path, "w") as jf:
-            json.dump(self.definitions, jf, indent=True, sort_keys=True)
+            json.dump({'files': self.files, 'definitions': self.definitions}, jf, indent=True, sort_keys=True)
 
     def generate_html(self, path):
         env = jinja2.Environment(
@@ -212,13 +282,10 @@ class Docoment(object):
         for path in self.paths:
             if os.path.isdir(path):
                 for root, dirs, files in os.walk(path):
-                    for pattern in self.patterns:
-                        for curfile in fnmatch.filter(files, pattern):
-                            self._parse_file(os.path.join(root, curfile))
-            else:
-                for pattern in self.patterns:
-                    if fnmatch.fnmatch(path, pattern):
-                        self._parse_file(path)
+                    for curfile in self.filematch.filter(files):
+                        self._parse_file(os.path.join(root, curfile))
+            elif self.filematch.match(path):
+                self._parse_file(path)
         if self.output_json:
             self.generate_json('result.json')
         if self.output_html:
@@ -226,8 +293,8 @@ class Docoment(object):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-c", "--config", help="Path to the docofile", default=None)
+    parser.add_argument("-c", "--config", help="Path to the docofile", default="docofile")
     args = parser.parse_args()
 
-    doc = Docoment(args.config)
+    doc = Docoment(config_file=args.config)
     doc.run()

@@ -4,6 +4,8 @@ path = <path>/src
        <path>/include
 extra_args = -I <path>/include
 files = *.c
+	*.h
+exclude = */test/*
 
 [output]
 json = true
